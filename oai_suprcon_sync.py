@@ -21,26 +21,40 @@ NS = {
 }
 
 
-def setup_logging(log_path: str):
-    # Если путь вида "oai_sync.log" без папки — не падаем
-    log_dir = os.path.dirname(log_path)
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-
+def setup_logging(log_file: str | None, quiet: bool):
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    fh = RotatingFileHandler(log_path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
-    fh.setFormatter(fmt)
+    handlers = []
 
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
+    if log_file:
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
 
+        fh = RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8"
+        )
+        fh.setFormatter(fmt)
+        handlers.append(fh)
+
+    if not quiet:
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        handlers.append(sh)
+
+    # если вообще нет хендлеров — отключаем лог полностью
     logger.handlers.clear()
-    logger.addHandler(fh)
-    logger.addHandler(sh)
+    for h in handlers:
+        logger.addHandler(h)
+
+    if not handlers:
+        logging.disable(logging.CRITICAL)
 
 
 def fetch(params):
@@ -67,7 +81,6 @@ def classify_id(arxiv_id: str):
         return "old", yymm, lookup_key
 
     if "." in s:
-        # YYYY.MMNNNNN
         try:
             yyyy, rest = s.split(".", 1)
             mm = rest[:2]
@@ -116,7 +129,6 @@ def parse_records(xml_text):
         cats_raw = normalize_ws(get_text(meta, "arxiv:categories"))
         cat_tokens = cats_raw.split() if cats_raw else []
 
-        # СТРОГО: только если присутствует cond-mat.supr-con
         if not any(is_suprcon_category(c) for c in cat_tokens):
             continue
 
@@ -197,21 +209,14 @@ def run_once(conn, overlap_days: int, polite_sleep: float):
         checkpoint = get_checkpoint(cur)
         conn.commit()
 
-    date_from = None
-    if checkpoint:
-        date_from = checkpoint - timedelta(days=overlap_days)
-
+    date_from = checkpoint - timedelta(days=overlap_days) if checkpoint else None
     logging.info("Sync start. checkpoint=%s from=%s overlap_days=%d", checkpoint, date_from, overlap_days)
 
     while True:
         if token:
             xml_text = fetch({"verb": "ListRecords", "resumptionToken": token})
         else:
-            params = {
-                "verb": "ListRecords",
-                "metadataPrefix": "arXiv",
-                "set": SET_SPEC
-            }
+            params = {"verb": "ListRecords", "metadataPrefix": "arXiv", "set": SET_SPEC}
             if date_from:
                 params["from"] = date_from.isoformat()
             xml_text = fetch(params)
@@ -248,10 +253,14 @@ def main():
     ap.add_argument("--pg", required=True, help="postgresql://user:pass@host:port/db")
     ap.add_argument("--overlap-days", type=int, default=2)
     ap.add_argument("--polite-sleep", type=float, default=0.5)
-    ap.add_argument("--log-file", default="./logs/oai_sync.log")
+
+    # NEW:
+    ap.add_argument("--log-file", default="", help="Путь к лог-файлу. Если пусто — файл не пишем.")
+    ap.add_argument("--quiet", action="store_true", help="Не выводить лог в консоль.")
+
     args = ap.parse_args()
 
-    setup_logging(args.log_file)
+    setup_logging(args.log_file or None, args.quiet)
     logging.info("START oai_suprcon_sync one-shot")
 
     conn = psycopg2.connect(args.pg)
