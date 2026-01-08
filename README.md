@@ -12,11 +12,10 @@ https://info.arxiv.org/help/oa/index.html
 ### Разовый запуск
 
 ```bash
-python .\oai_suprcon_sync.py `
-  --pg "postgresql://postgres:postgres@localhost:5432/Rag" `
-  --overlap-days 2 `
-  --polite-sleep 0.5 `
-  --log-file ".\logs\oai_sync.log"
+./.venv/bin/python oai_suprcon_sync.py \
+  --pg postgresql://rag_user:postgres@localhost:5432/rag \
+  --overlap-days 2 \
+  --polite-sleep 0.5
 ```
 ---
 
@@ -27,7 +26,47 @@ python .\oai_suprcon_sync.py `
 
 ---
 
-## Описание используемых сущностей бд (создаем вручную)
+##  Поднятие postgres и описание используемых сущностей бд (создаем вручную)
+
+### Установка PostgresSQL
+
+```bash
+sudo apt update
+sudo apt install -y postgresql postgresql-contrib
+
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+```
+
+### Создания пользователя и пароля в субд
+
+```bash
+sudo -u postgres psql
+```
+
+Вставить конфиг 
+
+```
+-- пользователь
+CREATE USER rag_user WITH PASSWORD 'postgres';
+
+-- база
+CREATE DATABASE rag
+  OWNER rag_user
+  ENCODING 'UTF8';
+
+-- права
+GRANT ALL PRIVILEGES ON DATABASE rag TO rag_user;
+```
+
+```bash
+\q
+```
+
+---
+
+### Используемые сущности
+
 
 ### Тип `paper_status`
 
@@ -43,6 +82,7 @@ BEGIN
       'NEW',
       'DOWNLOADING',
       'DONE',
+      'COMPLETED',
       'NOT_FOUND',
       'ERROR'
     );
@@ -99,4 +139,106 @@ INSERT INTO sync_state(source, last_success_datestamp)
 VALUES ('oai:physics:cond-mat:supr-con', NULL)
 ON CONFLICT (source) DO NOTHING;
 
+```
+
+---
+
+## Разворачивание на сервере
+
+### Установка зависимостей и подтягивание проекта
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv
+cd /opt
+sudo git clone https://github.com/progML/oai_suprcon_sync.git
+sudo chown -R $USER:$USER /opt/oai_suprcon_sync
+cd /opt/oai_suprcon_sync
+```
+
+### Создание виртуального окружения
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install --upgrade pip
+./.venv/bin/pip install requests psycopg2-binary
+source .venv/bin/activate
+pip install -U pip
+pip install requests psycopg2-binary
+deactivate
+```
+
+---
+### Создание пользователя (для запуска юнита)
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin arxiv
+sudo chown -R arxiv:arxiv /opt/oai_suprcon_sync
+```
+
+---
+### Создание systemd service (юнит для запуска)
+
+```bash
+sudo nano /etc/systemd/system/oai_suprcon_sync.service
+```
+
+Вставить следующие параметры
+
+```
+[Service]
+Type=oneshot
+User=arxiv
+Group=arxiv
+WorkingDirectory=/opt/oai_suprcon_sync
+ExecStart=/opt/oai_suprcon_sync/.venv/bin/python \
+  /opt/oai_suprcon_sync/oai_suprcon_sync.py \
+  --pg postgresql://rag_user:postgres@localhost:5432/rag \
+  --overlap-days 2 \
+  --polite-sleep 0.5
+NoNewPrivileges=true
+```
+
+### Создание timer
+
+
+```bash
+sudo nano /etc/systemd/system/oai_suprcon_sync.timer
+```
+
+Вставить следующие параметры
+
+```
+[Unit]
+Description=Run arXiv supr-con OAI sync every 60 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+---
+
+### Запуск
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now oai_suprcon_sync.timer
+```
+
+Проверка работы таймера
+
+```bash
+systemctl list-timers | grep oai_suprcon_sync
+```
+
+Просмотр журнала/лог
+
+```bash
+journalctl -u oai_suprcon_sync@$(whoami).service -n 100 --no-pager
+journalctl -xeu oai_suprcon_sync.service
 ```
