@@ -21,7 +21,13 @@ NS = {
 }
 
 
-def setup_logging(log_file: str | None, quiet: bool):
+# -------------------- logging --------------------
+
+def setup_logging(log_file: str | None):
+    """
+    Если log_file=None или пустой -> лог только в stdout.
+    Если указан -> RotatingFileHandler + stdout.
+    """
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
@@ -29,33 +35,24 @@ def setup_logging(log_file: str | None, quiet: bool):
 
     handlers = []
 
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    handlers.append(sh)
+
     if log_file:
         log_dir = os.path.dirname(log_file)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
-
-        fh = RotatingFileHandler(
-            log_file,
-            maxBytes=10 * 1024 * 1024,
-            backupCount=5,
-            encoding="utf-8"
-        )
+        fh = RotatingFileHandler(log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
         fh.setFormatter(fmt)
         handlers.append(fh)
 
-    if not quiet:
-        sh = logging.StreamHandler()
-        sh.setFormatter(fmt)
-        handlers.append(sh)
-
-    # если вообще нет хендлеров — отключаем лог полностью
     logger.handlers.clear()
     for h in handlers:
         logger.addHandler(h)
 
-    if not handlers:
-        logging.disable(logging.CRITICAL)
 
+# -------------------- http/xml --------------------
 
 def fetch(params):
     r = requests.get(BASE, params=params, timeout=60)
@@ -81,6 +78,7 @@ def classify_id(arxiv_id: str):
         return "old", yymm, lookup_key
 
     if "." in s:
+        # YYYY.MMNNNNN
         try:
             yyyy, rest = s.split(".", 1)
             mm = rest[:2]
@@ -129,6 +127,7 @@ def parse_records(xml_text):
         cats_raw = normalize_ws(get_text(meta, "arxiv:categories"))
         cat_tokens = cats_raw.split() if cats_raw else []
 
+        # строго: только если присутствует supr-con
         if not any(is_suprcon_category(c) for c in cat_tokens):
             continue
 
@@ -151,12 +150,57 @@ def parse_records(xml_text):
     return rows, token, max_ds
 
 
+# -------------------- sync_state helpers --------------------
+
 def ensure_sync_state(cur):
     cur.execute("""
-        insert into sync_state(source, last_success_datestamp)
-        values (%s, null)
+        insert into sync_state(source, updated_at)
+        values (%s, now())
         on conflict (source) do nothing
     """, (SOURCE_KEY,))
+
+
+def mark_running(cur, note: str | None):
+    cur.execute("""
+        update sync_state
+        set
+          last_status = 'RUNNING',
+          last_error = null,
+          last_run_started_at = now(),
+          last_run_finished_at = null,
+          updated_at = now(),
+          note = %s
+        where source = %s
+    """, (note, SOURCE_KEY))
+
+
+def mark_success(cur, *, rows_written: int, checkpoint_ds: date | None):
+    cur.execute("""
+        update sync_state
+        set
+          last_status = 'OK',
+          last_error = null,
+          last_run_finished_at = now(),
+          last_success_at = now(),
+          last_success_datestamp = %s,
+          last_rows = %s,
+          total_rows = total_rows + %s,
+          updated_at = now()
+        where source = %s
+    """, (checkpoint_ds, rows_written, rows_written, SOURCE_KEY))
+
+
+def mark_error(cur, *, err: str):
+    cur.execute("""
+        update sync_state
+        set
+          last_status = 'ERROR',
+          last_error = left(%s, 8000),
+          last_run_finished_at = now(),
+          last_rows = 0,
+          updated_at = now()
+        where source = %s
+    """, (err, SOURCE_KEY))
 
 
 def get_checkpoint(cur):
@@ -173,10 +217,13 @@ def update_checkpoint(cur, new_ds: date):
     """, (new_ds, SOURCE_KEY))
 
 
+# -------------------- main DB logic --------------------
+
 def upsert_rows(cur, rows):
     if not rows:
         return 0
 
+    # ВАЖНО: не трогаем arxiv_paper.status/attempts/last_error
     sql = """
     insert into arxiv_paper(
       arxiv_id, title, categories, id_type, yymm, lookup_key,
@@ -198,7 +245,6 @@ def upsert_rows(cur, rows):
     return len(rows)
 
 
-
 def run_once(conn, overlap_days: int, polite_sleep: float):
     total = 0
     max_seen = None
@@ -206,10 +252,15 @@ def run_once(conn, overlap_days: int, polite_sleep: float):
 
     with conn.cursor() as cur:
         ensure_sync_state(cur)
+        # note полезно для дебага
+        mark_running(cur, note=f"set={SET_SPEC}, overlap_days={overlap_days}, polite_sleep={polite_sleep}")
         checkpoint = get_checkpoint(cur)
         conn.commit()
 
-    date_from = checkpoint - timedelta(days=overlap_days) if checkpoint else None
+    date_from = None
+    if checkpoint:
+        date_from = checkpoint - timedelta(days=overlap_days)
+
     logging.info("Sync start. checkpoint=%s from=%s overlap_days=%d", checkpoint, date_from, overlap_days)
 
     while True:
@@ -244,6 +295,10 @@ def run_once(conn, overlap_days: int, polite_sleep: float):
             update_checkpoint(cur, max_seen)
             conn.commit()
 
+    with conn.cursor() as cur:
+        mark_success(cur, rows_written=total, checkpoint_ds=max_seen)
+        conn.commit()
+
     logging.info("Sync done. total_written=%d checkpoint_now=%s", total, max_seen)
     return total, max_seen
 
@@ -253,22 +308,25 @@ def main():
     ap.add_argument("--pg", required=True, help="postgresql://user:pass@host:port/db")
     ap.add_argument("--overlap-days", type=int, default=2)
     ap.add_argument("--polite-sleep", type=float, default=0.5)
-
-    # NEW:
-    ap.add_argument("--log-file", default="", help="Путь к лог-файлу. Если пусто — файл не пишем.")
-    ap.add_argument("--quiet", action="store_true", help="Не выводить лог в консоль.")
-
+    ap.add_argument("--log-file", default=None, help="путь до файла лога. если не задан -> только stdout")
     args = ap.parse_args()
 
-    setup_logging(args.log_file or None, args.quiet)
+    setup_logging(args.log_file)
     logging.info("START oai_suprcon_sync one-shot")
 
     conn = psycopg2.connect(args.pg)
     conn.autocommit = False
     try:
         run_once(conn, args.overlap_days, args.polite_sleep)
-    except Exception:
+    except Exception as e:
         logging.exception("FATAL ERROR")
+        try:
+            with conn.cursor() as cur:
+                ensure_sync_state(cur)
+                mark_error(cur, err=repr(e))
+                conn.commit()
+        except Exception:
+            pass
         raise
     finally:
         conn.close()

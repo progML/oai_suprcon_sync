@@ -129,16 +129,40 @@ CREATE INDEX IF NOT EXISTS arxiv_paper_oai_datestamp_idx
 Хранит состояние инкрементальной синхронизации OAI-PMH.
 
 ```sql
+-- Универсальный статус
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'sync_status') THEN
+    CREATE TYPE sync_status AS ENUM ('RUNNING', 'OK', 'ERROR');
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS sync_state (
-  source                TEXT PRIMARY KEY,
-  last_success_datestamp DATE,
-  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+  source                TEXT PRIMARY KEY,               -- уникальный ключ джоба, например: 'oai:physics:cond-mat:supr-con' или 'manifest:arxiv_pdf_manifest'
+
+  last_status           sync_status,                    -- RUNNING/OK/ERROR
+  last_error            TEXT,                           -- последняя ошибка (если была)
+
+  last_run_started_at   TIMESTAMPTZ,                    -- когда стартанул последний запуск
+  last_run_finished_at  TIMESTAMPTZ,                    -- когда закончился последний запуск
+  last_success_at       TIMESTAMPTZ,                    -- когда был последний успешный запуск
+
+  -- OAI-специфично (точка инкрементального обхода):
+  last_success_datestamp DATE,                          -- последний успешно обработанный OAI datestamp (YYYY-MM-DD)
+
+  -- Метрики/счётчики (универсально):
+  last_rows             BIGINT NOT NULL DEFAULT 0,      -- сколько строк записали в последнем запуске
+  total_rows            BIGINT NOT NULL DEFAULT 0,      -- накопительный счётчик
+
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  note                  TEXT                            -- произвольная заметка (например xml path / режим upsert)
 );
 
-INSERT INTO sync_state(source, last_success_datestamp)
-VALUES ('oai:physics:cond-mat:supr-con', NULL)
-ON CONFLICT (source) DO NOTHING;
+CREATE INDEX IF NOT EXISTS sync_state_status_idx
+  ON sync_state(last_status);
 
+CREATE INDEX IF NOT EXISTS sync_state_updated_idx
+  ON sync_state(updated_at);
 ```
 
 ---
