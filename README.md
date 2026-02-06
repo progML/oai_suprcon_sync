@@ -17,6 +17,10 @@ https://info.arxiv.org/help/oa/index.html
   --overlap-days 2 \
   --polite-sleep 0.5
 ```
+
+--pg Строка подключения к PostgreSQL
+--overlap-days 2 Страховка от пропущенных данных при инкрементальной синхронизации (минус 2 дня)
+--polite-sleep 0.5 Пауза между HTTP-запросами к arXiv (в секундах)
 ---
 
 ## Требования

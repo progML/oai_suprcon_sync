@@ -55,7 +55,7 @@ def setup_logging(log_file: str | None):
 # -------------------- http/xml --------------------
 
 def fetch(params):
-    r = requests.get(BASE, params=params, timeout=60)
+    r = requests.get(BASE, params=params, timeout=(15, 300))
     r.raise_for_status()
     return r.text
 
