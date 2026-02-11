@@ -305,7 +305,7 @@ def run_once(conn, overlap_days: int, polite_sleep: float):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pg", required=True, help="postgresql://user:pass@host:port/db")
+    # ap.add_argument("--pg", required=True, help="postgresql://user:pass@host:port/db")
     ap.add_argument("--overlap-days", type=int, default=2)
     ap.add_argument("--polite-sleep", type=float, default=0.5)
     ap.add_argument("--log-file", default=None, help="путь до файла лога. если не задан -> только stdout")
@@ -314,7 +314,13 @@ def main():
     setup_logging(args.log_file)
     logging.info("START oai_suprcon_sync one-shot")
 
-    conn = psycopg2.connect(args.pg)
+    conn = psycopg2.connect(
+        host = "localhost",
+        port = "5432",
+        dbname = "postgres",
+        user = "postgres",
+        password = "postgres",
+    )
     conn.autocommit = False
     try:
         run_once(conn, args.overlap_days, args.polite_sleep)
