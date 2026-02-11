@@ -230,16 +230,7 @@ def upsert_rows(cur, rows):
       oai_datestamp, is_deleted
     )
     values %s
-    on conflict (arxiv_id) do update set
-      title         = excluded.title,
-      categories    = excluded.categories,
-      id_type       = excluded.id_type,
-      yymm          = excluded.yymm,
-      lookup_key    = excluded.lookup_key,
-      oai_datestamp = excluded.oai_datestamp,
-      is_deleted    = excluded.is_deleted,
-      updated_at    = now(),
-      last_seen_at  = now();
+    on conflict (arxiv_id) do nothing;
     """
     execute_values(cur, sql, rows, page_size=2000)
     return len(rows)
