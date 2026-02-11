@@ -117,7 +117,15 @@ CREATE TABLE IF NOT EXISTS arxiv_paper (
 
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- какой воркер обрабатывает
+    locked_by       text,
+
+    -- момент захвата задачи
+    locked_at       timestamptz,
+
+    -- heartbeat (воркер жив)
+    heartbeat_at    timestamptz
 );
 
 CREATE INDEX IF NOT EXISTS arxiv_paper_status_yymm_idx
