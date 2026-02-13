@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import time
+import json
 import requests
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
@@ -52,7 +53,7 @@ def setup_logging(log_file: str | None):
         logger.addHandler(h)
 
 
-# -------------------- http/xml --------------------
+# -------------------- http/xml -------------------
 
 def fetch(params):
     r = requests.get(BASE, params=params, timeout=(15, 300))
@@ -134,6 +135,15 @@ def parse_records(xml_text):
         title = normalize_ws(get_text(meta, "arxiv:title"))
         id_type, yymm, lookup_key = classify_id(arxiv_id)
 
+        payload = {
+            "material": {},
+            "tc_K": None,
+            "dimensionality": None,
+            "type": None,
+            "unconventional": None,
+            "debye_frequency": []
+        }
+
         rows.append((
             arxiv_id,
             title,
@@ -142,7 +152,8 @@ def parse_records(xml_text):
             yymm,
             lookup_key,
             ds,
-            is_deleted
+            is_deleted,
+            json.dumps(payload)
         ))
 
     token_el = root.find(".//oai:resumptionToken", NS)
@@ -227,7 +238,7 @@ def upsert_rows(cur, rows):
     sql = """
     insert into arxiv_paper(
       arxiv_id, title, categories, id_type, yymm, lookup_key,
-      oai_datestamp, is_deleted
+      oai_datestamp, is_deleted, payload
     )
     values %s
     on conflict (arxiv_id) do nothing;
@@ -308,7 +319,7 @@ def main():
     conn = psycopg2.connect(
         host = "localhost",
         port = "5432",
-        dbname = "postgres",
+        dbname = "RAGprom",
         user = "postgres",
         password = "postgres",
     )
