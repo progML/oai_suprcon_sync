@@ -99,8 +99,6 @@ END $$;
 Хранит статьи arXiv, отфильтрованные по категории `cond-mat.supr-con`.
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-
 CREATE TABLE IF NOT EXISTS arxiv_paper (
   arxiv_id      TEXT PRIMARY KEY,
   title         TEXT,
@@ -118,7 +116,6 @@ CREATE TABLE IF NOT EXISTS arxiv_paper (
   last_error    TEXT,
   
   payload       JSONB,
-  embedding     vector(768),
 
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -142,11 +139,6 @@ CREATE INDEX IF NOT EXISTS arxiv_paper_oai_datestamp_idx
 CREATE INDEX IF NOT EXISTS arxiv_paper_payload_idx
   ON arxiv_paper
   USING gin(payload);
-  
-CREATE INDEX IF NOT EXISTS arxiv_paper_embedding_idx
-  ON arxiv_paper
-  USING ivfflat (embedding vector_cosine_ops)
-  WITH (lists = 100);
 ```
 
 
