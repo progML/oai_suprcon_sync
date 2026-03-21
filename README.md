@@ -1,288 +1,267 @@
-# arxiv supr-con sync
-Скрипт для **массовой (и затем инкрементальной) выгрузки** статей arXiv из OAI-PMH по категории:
-- `cond-mat.supr-con` (статья попадает в базу только если эта категория присутствует в списке категорий)
+# oai_suprcon_sync
 
-Источник OAI-PMH:  
-https://info.arxiv.org/help/oa/index.html
+Синхронизация arXiv статей через OAI-PMH для последующей обработки superconductivity-корпуса.
+
+Проект массово и инкрементально загружает записи из OAI-PMH arXiv, фильтрует статьи по наличию категории `supr-con` среди категорий записи и сохраняет базовые метаданные в PostgreSQL таблицу `arxiv_paper`.
 
 ---
 
-## Возможности
+## Что делает проект
 
-### Разовый запуск
+`oai_suprcon_sync.py`:
 
-```bash
-./.venv/bin/python oai_suprcon_sync.py \
-  --pg postgresql://rag_user:postgres@localhost:5432/rag \
-  --overlap-days 2 \
-  --polite-sleep 0.5
-```
+- ходит в OAI-PMH endpoint arXiv;
+- читает `ListRecords` и обрабатывает `resumptionToken`;
+- берёт записи из набора `physics:cond-mat`;
+- фильтрует их так, чтобы остались только статьи, где среди категорий присутствует `supr-con` / `*.supr-con`;
+- нормализует `arxiv_id`;
+- вычисляет `id_type`, `yymm`, `lookup_key`;
+- сохраняет записи в `arxiv_paper`;
+- ведёт checkpoint и статус синхронизации в `sync_state`.
 
---pg Строка подключения к PostgreSQL
---overlap-days 2 Страховка от пропущенных данных при инкрементальной синхронизации (минус 2 дня)
---polite-sleep 0.5 Пауза между HTTP-запросами к arXiv (в секундах)
+---
+
+## Зачем это нужно
+
+Это входная точка всего пайплайна.
+
+Именно этот проект формирует базовый список статей, которые дальше:
+
+- будут сопоставлены с tar-архивами;
+- будут проиндексированы по содержимому tar;
+- будут скачаны как PDF и переложены в целевое S3;
+- могут быть потом отправлены в RAG / vector store / downstream NLP-пайплайн.
+
+---
+
+## Источник данных
+
+- OAI-PMH endpoint arXiv: `https://oaipmh.arxiv.org/oai`
+- документация arXiv OAI-PMH: <https://info.arxiv.org/help/oa/index.html>
+
 ---
 
 ## Требования
 
 - Python 3.10+
-- PostgreSQL 14+ (или 15/16/17)
+- PostgreSQL
+- `requests`
+- `psycopg2-binary`
 
----
-
-##  Поднятие postgres и описание используемых сущностей бд (создаем вручную)
-
-### Установка PostgresSQL
+Установка:
 
 ```bash
-sudo apt update
-sudo apt install -y postgresql postgresql-contrib
-
-sudo systemctl start postgresql
-sudo systemctl enable postgresql
-```
-
-### Создания пользователя и пароля в субд
-
-```bash
-sudo -u postgres psql
-```
-
-Вставить конфиг 
-
-```
--- пользователь
-CREATE USER rag_user WITH PASSWORD 'postgres';
-
--- база
-CREATE DATABASE rag
-  OWNER rag_user
-  ENCODING 'UTF8';
-
--- права
-GRANT ALL PRIVILEGES ON DATABASE rag TO rag_user;
-```
-
-```bash
-\q
-```
-
----
-
-### Используемые сущности
-
-
-### Тип `paper_status`
-
-Используется для хранения состояния обработки статьи.
-
-```sql
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_type WHERE typname = 'paper_status'
-  ) THEN
-    CREATE TYPE paper_status AS ENUM (
-      'NEW',
-      'DOWNLOADING',
-      'DONE',
-      'COMPLETED',
-      'NOT_FOUND',
-      'ERROR'
-    );
-  END IF;
-END $$;
-```
-
-### Таблица `arxiv_paper`
-
-Хранит статьи arXiv, отфильтрованные по категории `cond-mat.supr-con`.
-
-```sql
-CREATE TABLE IF NOT EXISTS arxiv_paper (
-  arxiv_id      TEXT PRIMARY KEY,
-  title         TEXT,
-  categories    TEXT,
-
-  id_type       TEXT NOT NULL,
-  yymm          CHAR(4) NOT NULL,
-  lookup_key    TEXT NOT NULL,
-
-  oai_datestamp DATE,
-  is_deleted    BOOLEAN NOT NULL DEFAULT FALSE,
-
-  status        paper_status NOT NULL DEFAULT 'NEW',
-  attempts      INT NOT NULL DEFAULT 0,
-  last_error    TEXT,
-  
-  payload       JSONB,
-
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- какой воркер обрабатывает
-    locked_by       text,
-
-    -- момент захвата задачи
-    locked_at       timestamptz,
-
-    -- heartbeat (воркер жив)
-    heartbeat_at    timestamptz
-);
-
-CREATE INDEX IF NOT EXISTS arxiv_paper_status_yymm_idx
-  ON arxiv_paper(status, yymm);
-
-CREATE INDEX IF NOT EXISTS arxiv_paper_oai_datestamp_idx
-  ON arxiv_paper(oai_datestamp);
-  
-CREATE INDEX IF NOT EXISTS arxiv_paper_payload_idx
-  ON arxiv_paper
-  USING gin(payload);
-```
-
-
-
-
-### Таблица `sync_state`
-
-Хранит состояние инкрементальной синхронизации OAI-PMH.
-
-```sql
--- Универсальный статус
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'sync_status') THEN
-    CREATE TYPE sync_status AS ENUM ('RUNNING', 'OK', 'ERROR');
-  END IF;
-END $$;
-
-CREATE TABLE IF NOT EXISTS sync_state (
-  source                TEXT PRIMARY KEY,               -- уникальный ключ джоба, например: 'oai:physics:cond-mat:supr-con' или 'manifest:arxiv_pdf_manifest'
-
-  last_status           sync_status,                    -- RUNNING/OK/ERROR
-  last_error            TEXT,                           -- последняя ошибка (если была)
-
-  last_run_started_at   TIMESTAMPTZ,                    -- когда стартанул последний запуск
-  last_run_finished_at  TIMESTAMPTZ,                    -- когда закончился последний запуск
-  last_success_at       TIMESTAMPTZ,                    -- когда был последний успешный запуск
-
-  -- OAI-специфично (точка инкрементального обхода):
-  last_success_datestamp DATE,                          -- последний успешно обработанный OAI datestamp (YYYY-MM-DD)
-
-  -- Метрики/счётчики (универсально):
-  last_rows             BIGINT NOT NULL DEFAULT 0,      -- сколько строк записали в последнем запуске
-  total_rows            BIGINT NOT NULL DEFAULT 0,      -- накопительный счётчик
-
-  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-  note                  TEXT                            -- произвольная заметка (например xml path / режим upsert)
-);
-
-CREATE INDEX IF NOT EXISTS sync_state_status_idx
-  ON sync_state(last_status);
-
-CREATE INDEX IF NOT EXISTS sync_state_updated_idx
-  ON sync_state(updated_at);
-```
-
----
-
-## Разворачивание на сервере
-
-### Установка зависимостей и подтягивание проекта
-
-```bash
-sudo apt update
-sudo apt install -y git python3 python3-venv
-cd /opt
-sudo git clone https://github.com/progML/oai_suprcon_sync.git
-sudo chown -R $USER:$USER /opt/oai_suprcon_sync
-cd /opt/oai_suprcon_sync
-```
-
-### Создание виртуального окружения
-
-```bash
-python3 -m venv .venv
-./.venv/bin/pip install --upgrade pip
-./.venv/bin/pip install requests psycopg2-binary
+python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install requests psycopg2-binary
-deactivate
 ```
 
 ---
-### Создание пользователя (для запуска юнита)
+
+## Быстрый старт
 
 ```bash
-sudo useradd -r -s /usr/sbin/nologin arxiv
-sudo chown -R arxiv:arxiv /opt/oai_suprcon_sync
-```
-
----
-### Создание systemd service (юнит для запуска)
-
-```bash
-sudo nano /etc/systemd/system/oai_suprcon_sync.service
-```
-
-Вставить следующие параметры
-
-```
-[Service]
-Type=oneshot
-User=arxiv
-Group=arxiv
-WorkingDirectory=/opt/oai_suprcon_sync
-ExecStart=/opt/oai_suprcon_sync/.venv/bin/python \
-  /opt/oai_suprcon_sync/oai_suprcon_sync.py \
-  --pg postgresql://rag_user:postgres@localhost:5432/rag \
+python oai_suprcon_sync.py \
+  --pg postgresql://postgres:postgres@localhost:5432/rag \
   --overlap-days 2 \
   --polite-sleep 0.5
-NoNewPrivileges=true
 ```
 
-### Создание timer
-
+С логированием в файл:
 
 ```bash
-sudo nano /etc/systemd/system/oai_suprcon_sync.timer
-```
-
-Вставить следующие параметры
-
-```
-[Unit]
-Description=Run arXiv supr-con OAI sync every 60 minutes
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=60min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
+python oai_suprcon_sync.py \
+  --pg postgresql://postgres:postgres@localhost:5432/rag \
+  --overlap-days 2 \
+  --polite-sleep 0.5 \
+  --log-file /var/log/oai_suprcon_sync.log
 ```
 
 ---
 
-### Запуск
+## Аргументы CLI
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now oai_suprcon_sync.timer
+```text
+--pg            Postgres DSN
+--overlap-days  сколько дней перекрытия брать от последнего успешного checkpoint
+--polite-sleep  пауза между запросами к OAI-PMH
+--log-file      путь к лог-файлу, опционально
 ```
 
-Проверка работы таймера
+---
 
-```bash
-systemctl list-timers | grep oai_suprcon_sync
+## Что сохраняется в БД
+
+### Таблица `arxiv_paper`
+
+Минимальная схема, совместимая с текущей логикой проекта:
+
+```sql
+CREATE TABLE IF NOT EXISTS arxiv_paper (
+  arxiv_id       text PRIMARY KEY,
+  title          text,
+  categories     text,
+  id_type        text,
+  yymm           char(4),
+  lookup_key     text,
+  oai_datestamp  date,
+  is_deleted     boolean NOT NULL DEFAULT false,
+  payload        jsonb,
+
+  status         text DEFAULT 'NEW',
+  worker_id      text,
+  locked_at      timestamptz,
+  attempts       integer NOT NULL DEFAULT 0,
+  last_error     text,
+  updated_at     timestamptz NOT NULL DEFAULT now()
+);
 ```
 
-Просмотр журнала/лог
+### Индексы
 
-```bash
-journalctl -u oai_suprcon_sync@$(whoami).service -n 100 --no-pager
-journalctl -xeu oai_suprcon_sync.service
+```sql
+CREATE INDEX IF NOT EXISTS idx_arxiv_paper_lookup_key
+  ON arxiv_paper(lookup_key);
+
+CREATE INDEX IF NOT EXISTS idx_arxiv_paper_yymm
+  ON arxiv_paper(yymm);
+
+CREATE INDEX IF NOT EXISTS idx_arxiv_paper_status
+  ON arxiv_paper(status);
+
+CREATE INDEX IF NOT EXISTS idx_arxiv_paper_oai_datestamp
+  ON arxiv_paper(oai_datestamp);
 ```
+
+### Таблица `sync_state`
+
+```sql
+CREATE TABLE IF NOT EXISTS sync_state (
+  source                  text PRIMARY KEY,
+  last_status             text,
+  last_error              text,
+  last_run_started_at     timestamptz,
+  last_run_finished_at    timestamptz,
+  last_success_at         timestamptz,
+  last_success_datestamp  date,
+  last_rows               bigint DEFAULT 0,
+  total_rows              bigint DEFAULT 0,
+  note                    text,
+  updated_at              timestamptz NOT NULL DEFAULT now()
+);
+```
+
+---
+
+## Как вычисляются поля
+
+### `id_type`
+
+- `old` — старый формат id вроде `cond-mat/9801001`
+- `new` — новый формат вроде `2501.01234`
+- `other` — fallback, если формат распознать не удалось
+
+### `yymm`
+
+Используется для группировки и сопоставления с tar-архивами.
+
+Примеры:
+
+- `2501.01234` -> `2501`
+- `cond-mat/9801001` -> `9801`
+
+### `lookup_key`
+
+Нормализованный ключ для дальнейшего поиска PDF внутри tar.
+
+Примеры:
+
+- `2501.01234` -> `2501.01234`
+- `cond-mat/9801001` -> `cond-mat9801001`
+
+---
+
+## Логика инкрементальной синхронизации
+
+1. Проект читает checkpoint из `sync_state.last_success_datestamp`.
+2. Отступает назад на `overlap-days`.
+3. Делает OAI-PMH `ListRecords` с параметром `from`.
+4. Обрабатывает все страницы через `resumptionToken`.
+5. После успешной обработки обновляет checkpoint.
+
+Зачем нужен overlap:
+
+- чтобы не потерять записи на границах дат;
+- чтобы переживать частичные сбои и повторные запуски.
+
+---
+
+## Почему используется `ON CONFLICT DO NOTHING`
+
+Текущая реализация не перетирает существующие строки в `arxiv_paper`, что делает повторные запуски безопасными и не ломает downstream-статусы, связанные с обработкой PDF.
+
+Если понадобится полноценное обновление metadata, логику можно расширить до selective upsert.
+
+---
+
+## Проверка результата
+
+### Сколько статей загружено
+
+```sql
+SELECT count(*)
+FROM arxiv_paper;
+```
+
+### Сколько статей по год-месяцу
+
+```sql
+SELECT yymm, count(*)
+FROM arxiv_paper
+GROUP BY yymm
+ORDER BY yymm DESC;
+```
+
+### Пример выборки superconductivity-статей
+
+```sql
+SELECT arxiv_id, title, categories, yymm, lookup_key
+FROM arxiv_paper
+ORDER BY oai_datestamp DESC
+LIMIT 20;
+```
+
+### Состояние последней синхронизации
+
+```sql
+SELECT *
+FROM sync_state
+WHERE source = 'oai:physics:cond-mat:supr-con';
+```
+
+---
+
+## Типовые проблемы
+
+### OAI-PMH отвечает медленно
+
+Увеличьте `polite-sleep` и проверьте сеть. Проект уже использует таймауты для HTTP-запроса.
+
+### Дубликаты
+
+Повторные запуски безопасны из-за `ON CONFLICT DO NOTHING`.
+
+### Записи не попадают в выборку
+
+Проверьте, что среди категорий записи действительно есть `supr-con` или категория, оканчивающаяся на `.supr-con`.
+
+---
+
+## Идеи для развития
+
+- добавить selective upsert вместо `DO NOTHING`;
+- отдельно сохранять авторов, abstract и DOI;
+- вынести DDL в миграции;
+- добавить Dockerfile и cron/systemd примеры;
+- экспортировать метрики по длительности и числу обработанных страниц.
